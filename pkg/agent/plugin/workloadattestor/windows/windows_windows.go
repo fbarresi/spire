@@ -4,9 +4,12 @@ package windows
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
+	"unsafe"
 
 	"github.com/hashicorp/go-hclog"
 	"github.com/hashicorp/hcl"
@@ -67,6 +70,9 @@ type processInfo struct {
 	path       string
 	groups     []string
 	groupsSIDs []string
+	// Services are a slice type, as windows allows shared services (e.g., svchost.exe)
+	serviceNames        []string
+	serviceDisplayNames []string
 }
 
 func (p *Plugin) SetLogger(log hclog.Logger) {
@@ -91,6 +97,13 @@ func (p *Plugin) Attest(_ context.Context, req *workloadattestorv1.AttestRequest
 	}
 	for _, group := range process.groups {
 		selectorValues = addSelectorValueIfNotEmpty(selectorValues, "group_name", group)
+	}
+
+	for _, serviceName := range process.serviceNames {
+		selectorValues = addSelectorValueIfNotEmpty(selectorValues, "service_name", serviceName)
+	}
+	for _, serviceDisplayName := range process.serviceDisplayNames {
+		selectorValues = addSelectorValueIfNotEmpty(selectorValues, "service_display_name", serviceDisplayName)
 	}
 
 	// obtaining the workload process path and digest are behind a config flag
@@ -169,6 +182,9 @@ func (p *Plugin) newProcessInfo(pid int32, queryPath bool, disableGroupNames boo
 	}
 	groups := p.q.AllGroups(tokenGroups)
 
+	const AllServicesSid = "S-1-5-80-0"
+	const ServiceSidPrefix = "S-1-5-80-"
+
 	start := time.Now()
 	for _, group := range groups {
 		// Each group has a set of attributes that control how
@@ -177,14 +193,40 @@ func (p *Plugin) newProcessInfo(pid int32, queryPath bool, disableGroupNames boo
 		// https://docs.microsoft.com/en-us/windows/win32/secauthz/sid-attributes-in-an-access-token
 		enabledSelector := getGroupEnabledSelector(group.Attributes)
 		processInfo.groupsSIDs = append(processInfo.groupsSIDs, enabledSelector+":"+group.Sid.String())
+		var groupAccount, groupDomain string
 		if !disableGroupNames {
-			groupAccount, groupDomain, err := p.q.LookupAccount(group.Sid)
+			groupAccount, groupDomain, err = p.q.LookupAccount(group.Sid)
 			if err != nil {
 				p.log.Warn("failed to lookup account from group SID", "sid", group.Sid, "error", err)
 				continue
 			}
 			// If the LookupAccount call succeeded, we know that groupAccount is not empty
 			processInfo.groups = append(processInfo.groups, enabledSelector+":"+parseAccount(groupAccount, groupDomain))
+		}
+		// Is this a service?
+		if strings.HasPrefix(group.Sid.String(), ServiceSidPrefix) && group.Sid.String() != AllServicesSid {
+			// if disableGroupNames is set, we have to do a LookupAccount call anyway to get the service name,
+			// this lookup is local only, we will not force queries on an AD so this should be fine.
+			if groupAccount == "" {
+				groupAccount, groupDomain, err = p.q.LookupAccount(group.Sid)
+				if err != nil {
+					p.log.Warn("failed to lookup account from group SID", "sid", group.Sid, "error", err)
+					continue
+				}
+			}
+
+			var serviceName = groupAccount
+
+			processInfo.serviceNames = append(processInfo.serviceNames, serviceName)
+
+			serviceDisplayName, err := p.q.LookupServiceDisplayName(serviceName)
+			if err != nil {
+				p.log.Error("Could not resolve service display name", "service_name", serviceName, telemetry.Error, err)
+			}
+
+			if serviceDisplayName != "" {
+				processInfo.serviceDisplayNames = append(processInfo.serviceDisplayNames, serviceDisplayName)
+			}
 		}
 	}
 	if !disableGroupNames {
@@ -268,6 +310,9 @@ type processQueryer interface {
 	// GetProcessExe returns the executable file path relating to the
 	// specified process handle.
 	GetProcessExe(windows.Handle) (string, error)
+
+	// LookupServiceDisplayName returns the display name of the specified service.
+	LookupServiceDisplayName(string) (string, error)
 }
 
 type processQuery struct{}
@@ -318,6 +363,52 @@ func (q *processQuery) GetProcessExe(h windows.Handle) (string, error) {
 	}
 
 	return windows.UTF16ToString(buf), nil
+}
+
+func (q *processQuery) LookupServiceDisplayName(serviceName string) (string, error) {
+	scm, err := windows.OpenSCManager(nil, nil, windows.SC_MANAGER_CONNECT)
+	if err != nil {
+		return "", fmt.Errorf("failed to open service control manager: %w", err)
+	}
+	defer func(handle windows.Handle) {
+		_ = windows.CloseServiceHandle(handle)
+	}(scm)
+
+	namePtr, err := windows.UTF16PtrFromString(serviceName)
+	if err != nil {
+		return "", err
+	}
+	svcHandle, err := windows.OpenService(scm, namePtr, windows.SERVICE_QUERY_CONFIG)
+	if err != nil {
+		return "", err
+	}
+	defer func(handle windows.Handle) {
+		_ = windows.CloseServiceHandle(handle)
+	}(svcHandle)
+
+	// SERVICE_CONFIG_DISPLAY_NAME (Level 2)
+	var bytesNeeded uint32
+	err = windows.QueryServiceConfig2(svcHandle, 2, nil, 0, &bytesNeeded)
+	if err != nil && !errors.Is(err, windows.ERROR_INSUFFICIENT_BUFFER) {
+		return "", err
+	}
+	if bytesNeeded == 0 {
+		return "", nil
+	}
+	buffer := make([]byte, bytesNeeded)
+	err = windows.QueryServiceConfig2(svcHandle, 2, &buffer[0], bytesNeeded, &bytesNeeded)
+	if err != nil {
+		return "", err
+	}
+	var displayName string
+	// structure SERVICE_DISPLAY_NAME has a LPWSTR at the first position.
+	descPtr := (*uint16)(unsafe.Pointer(&buffer[0]))
+	if descPtr == nil {
+		return "", nil
+	}
+	displayName = windows.UTF16PtrToString(descPtr)
+
+	return displayName, nil
 }
 
 func addSelectorValueIfNotEmpty(selectorValues []string, kind, value string) []string {

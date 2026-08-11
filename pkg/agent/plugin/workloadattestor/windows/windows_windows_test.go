@@ -30,6 +30,9 @@ var (
 	sidGroup1, _     = windows.StringToSid("S-1-5-21-759542327-988462579-1707944338-1004")
 	sidGroup2, _     = windows.StringToSid("S-1-5-21-759542327-988462579-1707944338-1005")
 	sidGroup3, _     = windows.StringToSid("S-1-2-0")
+	sidSvcUser, _    = windows.StringToSid("S-1-5-80-1234567890-1234567890-1234567890-12")
+	sidSvcGroup, _   = windows.StringToSid("S-1-5-80-1234567890-1234567890-1234567890-13")
+	sidAllSvc, _     = windows.StringToSid("S-1-5-80-0")
 	sidAndAttrGroup1 = windows.SIDAndAttributes{
 		Sid:        sidGroup1,
 		Attributes: windows.SE_GROUP_ENABLED,
@@ -41,6 +44,22 @@ var (
 	sidAndAttrGroup3 = windows.SIDAndAttributes{
 		Sid:        sidGroup3,
 		Attributes: windows.SE_GROUP_ENABLED,
+	}
+	sidAndAttrGroup4 = windows.SIDAndAttributes{
+		Sid:        sidSvcGroup,
+		Attributes: windows.SE_GROUP_ENABLED,
+	}
+	sidAndAttrGroup5 = windows.SIDAndAttributes{
+		Sid:        sidSvcGroup,
+		Attributes: windows.SE_GROUP_USE_FOR_DENY_ONLY,
+	}
+	sidAndAttrGroup6 = windows.SIDAndAttributes{
+		Sid:        sidAllSvc,
+		Attributes: windows.SE_GROUP_ENABLED,
+	}
+	sidAndAttrGroup7 = windows.SIDAndAttributes{
+		Sid:        sidAllSvc,
+		Attributes: windows.SE_GROUP_USE_FOR_DENY_ONLY,
 	}
 )
 
@@ -355,6 +374,120 @@ func TestAttest(t *testing.T) {
 				},
 			},
 		},
+		{
+			name:        "successful for service with groups enabled",
+			trustDomain: "example.org",
+			pq: &fakeProcessQuery{
+				handle:             windows.InvalidHandle,
+				tokenUser:          &windows.Tokenuser{User: windows.SIDAndAttributes{Sid: sidSvcUser}},
+				tokenGroups:        &windows.Tokengroups{Groups: [1]windows.SIDAndAttributes{sidAndAttrGroup4}},
+				account:            "NetworkService",
+				domain:             "NT AUTHORITY",
+				sidAndAttributes:   []windows.SIDAndAttributes{sidAndAttrGroup4},
+				serviceDisplayName: "My Fancy Service Name",
+			},
+			expectSelectors: []string{
+				"windows:user_name:NT AUTHORITY\\NetworkService",
+				"windows:user_sid:" + sidSvcUser.String(),
+				"windows:group_sid:se_group_enabled:true:" + sidSvcGroup.String(),
+				"windows:group_name:se_group_enabled:true:My Service",
+				"windows:service_name:My Service",
+				"windows:service_display_name:My Fancy Service Name",
+			},
+			expectCode: codes.OK,
+		},
+		{
+			name:        "successful for service with errors looking up group name",
+			trustDomain: "example.org",
+			pq: &fakeProcessQuery{
+				handle:                   windows.InvalidHandle,
+				tokenUser:                &windows.Tokenuser{User: windows.SIDAndAttributes{Sid: sidSvcUser}},
+				tokenGroups:              &windows.Tokengroups{Groups: [1]windows.SIDAndAttributes{sidAndAttrGroup4}},
+				account:                  "NetworkService",
+				domain:                   "NT AUTHORITY",
+				sidAndAttributes:         []windows.SIDAndAttributes{sidAndAttrGroup4},
+				getServiceDisplayNameErr: errors.New("lookup service display name error"),
+			},
+			expectSelectors: []string{
+				"windows:user_name:NT AUTHORITY\\NetworkService",
+				"windows:user_sid:" + sidSvcUser.String(),
+				"windows:group_sid:se_group_enabled:true:" + sidSvcGroup.String(),
+				"windows:group_name:se_group_enabled:true:My Service",
+				"windows:service_name:My Service",
+			},
+			expectCode: codes.OK,
+			expectLogs: []spiretest.LogEntry{
+				{
+					Level:   logrus.ErrorLevel,
+					Message: "Could not resolve service display name",
+					Data: logrus.Fields{
+						logrus.ErrorKey: "lookup service display name error",
+						telemetry.PID:   fmt.Sprint(testPID),
+						"service_name":  "My Service",
+					},
+				},
+			},
+		},
+		{
+			name:        "successful for service with groups disabled",
+			trustDomain: "example.org",
+			pq: &fakeProcessQuery{
+				handle:             windows.InvalidHandle,
+				tokenUser:          &windows.Tokenuser{User: windows.SIDAndAttributes{Sid: sidSvcUser}},
+				tokenGroups:        &windows.Tokengroups{Groups: [1]windows.SIDAndAttributes{sidAndAttrGroup5}},
+				account:            "NetworkService",
+				domain:             "NT AUTHORITY",
+				sidAndAttributes:   []windows.SIDAndAttributes{sidAndAttrGroup5},
+				serviceDisplayName: "My Fancy Service Name",
+			},
+			expectSelectors: []string{
+				"windows:user_name:NT AUTHORITY\\NetworkService",
+				"windows:user_sid:" + sidSvcUser.String(),
+				"windows:group_sid:se_group_enabled:false:" + sidSvcGroup.String(),
+				"windows:group_name:se_group_enabled:false:My Service",
+				"windows:service_name:My Service",
+				"windows:service_display_name:My Fancy Service Name",
+			},
+			expectCode: codes.OK,
+		},
+		{
+			name:        "successful for all service group",
+			trustDomain: "example.org",
+			pq: &fakeProcessQuery{
+				handle:           windows.InvalidHandle,
+				tokenUser:        &windows.Tokenuser{User: windows.SIDAndAttributes{Sid: sidAllSvc}},
+				tokenGroups:      &windows.Tokengroups{Groups: [1]windows.SIDAndAttributes{sidAndAttrGroup6}},
+				account:          "SYSTEM",
+				domain:           "NT AUTHORITY",
+				sidAndAttributes: []windows.SIDAndAttributes{sidAndAttrGroup6},
+			},
+			expectSelectors: []string{
+				"windows:user_name:NT AUTHORITY\\SYSTEM",
+				"windows:user_sid:" + sidAllSvc.String(),
+				"windows:group_sid:se_group_enabled:true:" + sidAllSvc.String(),
+				"windows:group_name:se_group_enabled:true:NT AUTHORITY\\SYSTEM",
+			},
+			expectCode: codes.OK,
+		},
+		{
+			name:        "successful for all service with groups disabled",
+			trustDomain: "example.org",
+			pq: &fakeProcessQuery{
+				handle:           windows.InvalidHandle,
+				tokenUser:        &windows.Tokenuser{User: windows.SIDAndAttributes{Sid: sidAllSvc}},
+				tokenGroups:      &windows.Tokengroups{Groups: [1]windows.SIDAndAttributes{sidAndAttrGroup7}},
+				account:          "SYSTEM",
+				domain:           "NT AUTHORITY",
+				sidAndAttributes: []windows.SIDAndAttributes{sidAndAttrGroup7},
+			},
+			expectSelectors: []string{
+				"windows:user_name:NT AUTHORITY\\SYSTEM",
+				"windows:user_sid:" + sidAllSvc.String(),
+				"windows:group_sid:se_group_enabled:false:" + sidAllSvc.String(),
+				"windows:group_name:se_group_enabled:false:NT AUTHORITY\\SYSTEM",
+			},
+			expectCode: codes.OK,
+		},
 	}
 
 	for _, testCase := range testCases {
@@ -416,21 +549,23 @@ func (w *windowsTest) loadPlugin(t *testing.T, q *fakeProcessQuery, trustDomain 
 }
 
 type fakeProcessQuery struct {
-	handle           windows.Handle
-	tokenUser        *windows.Tokenuser
-	tokenGroups      *windows.Tokengroups
-	account, domain  string
-	sidAndAttributes []windows.SIDAndAttributes
-	exe              string
+	handle             windows.Handle
+	tokenUser          *windows.Tokenuser
+	tokenGroups        *windows.Tokengroups
+	account, domain    string
+	sidAndAttributes   []windows.SIDAndAttributes
+	exe                string
+	serviceDisplayName string
 
-	openProcessErr       error
-	openProcessTokenErr  error
-	lookupAccountErr     error
-	getTokenUserErr      error
-	getTokenGroupsErr    error
-	closeHandleErr       error
-	closeProcessTokenErr error
-	getProcessExeErr     error
+	openProcessErr           error
+	openProcessTokenErr      error
+	lookupAccountErr         error
+	getTokenUserErr          error
+	getTokenGroupsErr        error
+	closeHandleErr           error
+	closeProcessTokenErr     error
+	getProcessExeErr         error
+	getServiceDisplayNameErr error
 }
 
 func (q *fakeProcessQuery) OpenProcess(int32) (handle windows.Handle, err error) {
@@ -455,6 +590,12 @@ func (q *fakeProcessQuery) LookupAccount(sid *windows.SID) (account, domain stri
 		return "group2", "domain2", nil
 	case sidGroup3:
 		return "LOCAL", "", nil
+	case sidSvcUser:
+		return "NetworkService", "NT AUTHORITY", nil
+	case sidSvcGroup:
+		return "My Service", "", nil
+	case sidAllSvc:
+		return "SYSTEM", "NT AUTHORITY", nil
 	}
 
 	return "", "", fmt.Errorf("sid not expected: %s", sid.String())
@@ -482,6 +623,10 @@ func (q *fakeProcessQuery) CloseProcessToken(windows.Token) error {
 
 func (q *fakeProcessQuery) GetProcessExe(windows.Handle) (string, error) {
 	return q.exe, q.getProcessExeErr
+}
+
+func (q *fakeProcessQuery) LookupServiceDisplayName(string) (string, error) {
+	return q.serviceDisplayName, q.getServiceDisplayNameErr
 }
 
 func setupTest() *windowsTest {
