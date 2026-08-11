@@ -8,6 +8,7 @@ import (
 	"github.com/spiffe/spire/pkg/agent/plugin/workloadattestor/systemd"
 	"github.com/spiffe/spire/pkg/agent/plugin/workloadattestor/unix"
 	"github.com/spiffe/spire/pkg/agent/plugin/workloadattestor/windows"
+	"github.com/spiffe/spire/pkg/agent/plugin/workloadattestor/windows_service"
 	"github.com/spiffe/spire/pkg/common/catalog"
 )
 
@@ -35,6 +36,7 @@ func (repo *workloadAttestorRepository) BuiltIns() []catalog.BuiltIn {
 		systemd.BuiltIn(),
 		unix.BuiltIn(),
 		windows.BuiltIn(),
+		windows_service.BuiltIn(),
 	}
 }
 
